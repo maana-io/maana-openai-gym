@@ -11,9 +11,10 @@ from jinja2 import Environment
 import numpy as np
 
 # GraphQL
-from shared.graphiql import GraphIQL
 import graphql as gql
+from shared.graphiql import GraphIQL
 from graphql_tools import build_executable_schema
+from scalars import scalars
 
 # OpenAI Gym
 import gym
@@ -29,16 +30,18 @@ logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 ENV_NAME = "FrozenLake-v0"
 
 source_schema = """
+    scalar JSON
+
     schema {
         query: RootQuery
     }
 
     type RootQuery {
-        learn(env: String!, endpoint: String!, decideFn: String!, observeFn: String!, resetFn: String!, context: String!, episodes: Int!, steps: Int!): Boolean!
-        decide(context: String!, state: String!): String!
-        observe(context: String!, state: String!, state2: String!, reward: Float!, done: Boolean!, info: String!): String!
-        reset(context: String!, actionSpace: SpaceAsInput! observationSpace: SpaceAsInput!): String!
-        sampleActionSpace(env: String!): String!
+        train(env: String!, endpoint: String!, decideFn: String!, learnFn: String!, initFn: String!, context: JSON!, episodes: Int!, steps: Int!): JSON!
+        decide(context: JSON!, state: JSON!): JSON!
+        learn(context: JSON!, action: JSON!, state: JSON!, state2: JSON!, reward: Float!, done: Boolean!, info: JSON!): JSON!
+        init(context: JSON!, actionSpace: SpaceAsInput! observationSpace: SpaceAsInput!): JSON!
+        sampleActionSpace(env: String!): JSON! # @TODO: interface Box/Discrete
     }
 
     input SpaceAsInput {
@@ -51,43 +54,52 @@ source_schema = """
 
 resolvers = {
     'RootQuery': {
-        'learn': lambda value, info, **args: learn(args['env'], args['endpoint'], args['decideFn'], args['observeFn'], args['resetFn'], args['context'], args['episodes'], args['steps']),
+        'train': lambda value, info, **args: train(args['env'], args['endpoint'], args['decideFn'], args['learnFn'], args['initFn'], args['context'], args['episodes'], args['steps']),
         'decide': lambda value, info, **args: decide(args['context'], args['state']),
-        'observe': lambda value, info, **args: observe(args['context'], args['state'], args['state2'], args['reward'], args['done'], args['info']),
-        'reset': lambda value, info, **args: reset(args['context'], args['actionSpace'], args['observationSpace']),
+        'learn': lambda value, info, **args: learn(args['context'], args['action'], args['state'], args['state2'], args['reward'], args['done'], args['info']),
+        'init': lambda value, info, **args: init(args['context'], args['actionSpace'], args['observationSpace']),
         'sampleActionSpace': lambda value, info, **args: sample_action_space(args['env'])
     }
 }
 
-executable_schema = build_executable_schema(source_schema, resolvers)
+executable_schema = build_executable_schema(source_schema, resolvers, scalars)
 
 #
 # Resolver implementation
 #
 
 
-async def learn(env_name, endpoint, decideFn, observeFn, resetFn, context, episodes, steps):
-    print(f'learn(env={env_name},endpoint={endpoint},decideFn={decideFn},observeFn={observeFn},resetFn={resetFn},context={context},episodes={episodes},steps={steps})')
+async def train(env_name, endpoint, decideFn, learnFn, initFn, context, episodes, steps):
+    print(f'train(env={env_name},endpoint={endpoint},decideFn={decideFn},learnFn={learnFn},initFn={initFn},context={context},episodes={episodes},steps={steps})')
     env = gym.make(env_name)
-    context = await call_reset(endpoint, resetFn, context, env)
+    context = await call_init(endpoint, initFn, context, env)
+    wins = 0
+    tot = 0
     for i in range(episodes):
         # print(f'{i}/{episodes}')
         state = env.reset()
         for j in range(steps):
+            tot += 1
             action = await call_decide(endpoint, decideFn, context, state)
             state2, reward, done, info = env.step(action)
 
-            context = await call_observe(endpoint, observeFn,
-                                         context, action, state, state2, reward, done, info)
+            context = await call_learn(endpoint, learnFn,
+                                       context, action, state, state2, reward, done, info)
 
             if done:
-                # env.render()
+                env.render()
+                win = False
+                if reward > 0:
+                    wins += 1
+                    win = True
+
+                print(f'  steps: {win} {j} {wins}/{tot}')
                 break
 
             state = state2
 
     print(f'final context={context}')
-    return True
+    return context
 
 
 def sample_action_space(env_name):
@@ -99,15 +111,19 @@ def sample_action_space(env_name):
 #
 
 
-def try_parse_json(input):
-    if isinstance(input, str):
-        return json.loads(input)
-    return input
+async def init(context, action_space, observation_space):
+    # print(
+    #     f'init(contex = {context}, actionSpace = {action_space}, observationSpace = {observation_space})')
+
+    rows = observation_space['n']
+    cols = action_space['n']
+
+    context['Q'] = np.zeros((rows,  cols))
+
+    return context
 
 
-async def decide(contextJs, stateJs):
-    context = try_parse_json(contextJs)
-    state = try_parse_json(stateJs)
+async def decide(context, state):
     # print(f'decide({context},{state})')
 
     epsilon = context['epsilon']
@@ -121,44 +137,28 @@ async def decide(contextJs, stateJs):
     return action
 
 
-async def observe(contextJs, action, stateJs, state2Js, reward, done, info):
-    context = try_parse_json(contextJs)
-    state = try_parse_json(stateJs)
-    state2 = try_parse_json(state2Js)
+async def learn(context, action, state, state2, reward, done, info):
     # print(
-    #     f'observe(action = {action}, context = {context}, state = {state}, state2 = {state2}, reward = {reward}, done = {done}, info = {info})')
+    #     f'learn(action = {action}, context = {context}, state = {state}, state2 = {state2}, reward = {reward}, done = {done}, info = {info})')
 
     Q = context['Q']
     gamma = context['gamma']
-    lr_rate = context['lr_rate']
+    alpha = context['alpha']
 
     predict = Q[state, action]
     target = reward + gamma * np.max(Q[state2, :])
-    Q[state, action] = Q[state, action] + lr_rate * (target - predict)
-
-    # print(f'Q[s, a]={Q[state, action]}, predict={predict}, target={target}, reward={reward}, action={action}, state={state}, state2={state2}, lr_rate={lr_rate}, gamma={gamma}')
+    Q[state, action] = Q[state, action] + alpha * (target - predict)
 
     context['Q'] = Q
     return context
 
-
-async def reset(contextJs, actionSpaceJs, observationSpaceJs):
-    context = try_parse_json(contextJs)
-    action_space = try_parse_json(actionSpaceJs)
-    observation_space = try_parse_json(observationSpaceJs)
-    # print(
-    #     f'reset(ctx = {context}, actionSpace = {action_space}, observationSpace = {observation_space})')
-
-    context['Q'] = np.zeros((observation_space['n'], action_space['n']))
-
-    return context
 
 #
 # Helpers
 #
 
 
-def serialize_space(space):
+def create_space_dict(space):
     obj = dict()
     if isinstance(space, gym.spaces.Box):
         obj['low'] = space.low.tolist()
@@ -169,11 +169,11 @@ def serialize_space(space):
         obj['n'] = space.n
         obj['shape'] = space.shape
         obj['dtype'] = space.dtype.name
-    return json.dumps(obj)
+    return obj
 
 
-async def call_reset(endpoint, resetFn, context, env):
-    return await reset(context, serialize_space(env.action_space), serialize_space(env.observation_space))
+async def call_init(endpoint, initFn, context, env):
+    return await init(context, create_space_dict(env.action_space), create_space_dict(env.observation_space))
     # client = CKGClient(endpoint)
     # return context
 
@@ -184,8 +184,8 @@ async def call_decide(endpoint, decideFn, context, state):
     # return action
 
 
-async def call_observe(endpoint, observeFn, context, action, state, state2, reward, done, info):
-    return await observe(context, action, state, state2, reward, done, info)
+async def call_learn(endpoint, learnFn, context, action, state, state2, reward, done, info):
+    return await learn(context, action, state, state2, reward, done, info)
     # return context
 
 
@@ -201,7 +201,7 @@ async def handle_event(x):
     return None
 
 
-def init(loopy):
+def init_server(loopy):
     asyncio.set_event_loop(loopy)
     app = web.Application(loop=loopy)
 
@@ -270,7 +270,7 @@ def init(loopy):
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     try:
-        init(loop)
+        init_server(loop)
     except KeyboardInterrupt:
         loop.close()
         sys.exit(1)
