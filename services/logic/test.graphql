@@ -1,0 +1,38 @@
+query tokenize {
+  tokens(model: "en", text: "The pig drove the car to New York.") {
+    text
+    lemma
+    pos
+    dep
+    tag
+    shape
+    isAlpha
+    isStop
+  }
+}
+
+query render {
+  render(model: "en", text: "The pig drove the car to New York.", style: DEP)
+}
+
+query entities {
+  entities(model: "en", text: "The pig drove the car to New York.") {
+    text
+    start
+    end
+    label
+  }
+}
+
+query trainNER {
+  trainNER(
+    model: "en"
+    labels: ["ANIMAL", "VEHICLE"]
+    samples: [
+      {
+        text: "The pig drove the car to New York."
+        entities: [{ start: 4, end: 6, label: "ANIMAL" }]
+      }
+    ]
+  )
+}

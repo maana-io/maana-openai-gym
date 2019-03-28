@@ -1,0 +1,14 @@
+FROM alpine:latest
+
+WORKDIR /app
+
+COPY . /app
+
+RUN echo "http://dl-8.alpinelinux.org/alpine/edge/community" >> /etc/apk/repositories ;\
+  apk add --update --no-cache --update-cache ca-certificates gcc python3 python3-dev py-pip build-base wget freetype-dev libpng-dev openblas-dev eudev-dev linux-headers ;\
+  ln -s /usr/include/locale.h /usr/include/xlocale.h ;\
+  pip3 install --no-cache-dir -r requirements.txt
+
+EXPOSE 7357
+
+CMD ["python3.7", "server.py"]

@@ -1,0 +1,13 @@
+query train {
+  learn(
+    # env: "CartPole-v0"
+    env: "FrozenLake-v0"
+    episodes: 10000
+    steps: 100
+    context: "{ \"epsilon\": 0.9, \"lr_rate\": 0.01, \"gamma\": 0.96, \"Q\": [] }"
+    endpoint: "http://localhost:7357/graphql"
+    resetFn: "reset"
+    observeFn: "observe"
+    decideFn: "decide"
+  )
+}
