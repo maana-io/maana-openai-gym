@@ -27,7 +27,7 @@ from shared.maana_amqp_pubsub import amqp_pubsub, configuration
 from settings import SERVICE_ID, SERVICE_PORT, RABBITMQ_ADDR, RABBITMQ_PORT, SERVICE_ADDRESS, REMOTE_KSVC_ENDPOINT_URL
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
+logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 
 source_schema = """
     scalar JSON
@@ -35,14 +35,16 @@ source_schema = """
     schema {
         query: RootQuery
     }
-    
+
     type RootQuery {
         train(env: String!, endpoint: String!, decideFn: String!, learnFn: String!, initFn: String!, context: JSON!, episodes: Int!, steps: Int!): JSON!
-        decide(context: JSON!, state: JSON!): JSON!
-        learn(context: JSON!, action: JSON!, state: JSON!, state2: JSON!, reward: Float!, done: Boolean!, info: JSON!): JSON!
-        init(context: JSON!, actionSpace: SpaceAsInput! observationSpace: SpaceAsInput!): JSON!
+        play(env: String!, endpoint: String!, decideFn: String!, context: JSON!): JSON!
         sampleActionSpace(env: String!): Space!
         listEnvs: [String!]
+        #
+        test_decide(context: JSON!, state: JSON!): JSON!
+        test_learn(context: JSON!, action: JSON!, state: JSON!, state2: JSON!, reward: Float!, done: Boolean!, inf: JSON!): JSON!
+        test_init(context: JSON!, actionSpace: SpaceAsInput! observationSpace: SpaceAsInput!): JSON!
     }
 
     enum SpaceType {
@@ -64,6 +66,11 @@ source_schema = """
 
     input SpaceAsInput {
         type: SpaceType!
+        n: Int
+        lowR: [Float!]
+        highR: [Float!]
+        lowZ: [Int!]
+        highZ: [Int]
         shape: [Int!]!
         dtype: String!
     }
@@ -73,13 +80,16 @@ source_schema = """
 resolvers = {
     'RootQuery': {
         'train': lambda value, info, **args: train(args['env'], args['endpoint'], args['decideFn'], args['learnFn'], args['initFn'], args['context'], args['episodes'], args['steps']),
-        'decide': lambda value, info, **args: decide(args['context'], args['state']),
-        'learn': lambda value, info, **args: learn(args['context'], args['action'], args['state'], args['state2'], args['reward'], args['done'], args['info']),
-        'init': lambda value, info, **args: init(args['context'], args['actionSpace'], args['observationSpace']),
+        'play': lambda value, info, **args: play(args['env'], args['endpoint'], args['decideFn'], args['context']),
         'sampleActionSpace': lambda value, info, **args: sample_action_space(args['env']),
-        'listEnvs': lambda value, info, **args: list_envs()
+        'listEnvs': lambda value, info, **args: list_envs(),
+        #
+        'test_decide': lambda value, info, **args: decide(args['context'], args['state']),
+        'test_learn': lambda value, info, **args: learn(args['context'], args['action'], args['state'], args['state2'], args['reward'], args['done'], args['inf']),
+        'test_init': lambda value, info, **args: init(args['context'], args['actionSpace'], args['observationSpace'])
     }
 }
+
 
 executable_schema = build_executable_schema(source_schema, resolvers, scalars)
 
@@ -95,7 +105,8 @@ async def train(env_name, endpoint, decideFn, learnFn, initFn, context, episodes
     global ENV_NAME
     ENV_NAME = env_name
     env = try_make_env(env_name)
-    context = await call_init(endpoint, initFn, context, env)
+    client = CKGClient(endpoint, is_auth=False)
+    context = await call_init(client, initFn, context, env)
     wins = 0
     tot = 0
     for i in range(episodes):
@@ -103,11 +114,11 @@ async def train(env_name, endpoint, decideFn, learnFn, initFn, context, episodes
         state = env.reset()
         for j in range(steps):
             tot += 1
-            action = await call_decide(endpoint, decideFn, context, state)
-            state2, reward, done, info = env.step(action)
+            action = await call_decide(client, decideFn, context, state)
+            state2, reward, done, inf = env.step(action)
 
-            context = await call_learn(endpoint, learnFn,
-                                       context, action, state, state2, reward, done, info)
+            context = await call_learn(client, learnFn,
+                                       context, action, state, state2, reward, done, inf)
 
             if done:
                 env.render()
@@ -129,11 +140,12 @@ async def play(env_name, endpoint, decideFn, context):
     # print(
     #     f'play(env={env_name},endpoint={endpoint},decideFn={decideFn},context={context})')
     env = try_make_env(env_name)
+    client = CKGClient(endpoint, is_auth=False)
     state = env.reset()
     env.render()
     done = False
     while not done:
-        action = await call_decide(endpoint, decideFn, context, state)
+        action = await call_decide(client, decideFn, context, state)
         state2, _, done, _ = env.step(action)
         env.render()
         state = state2
@@ -160,7 +172,7 @@ def list_envs():
 
 async def init(context, action_space, observation_space):
     # print(
-    #     f'init(contex = {context}, actionSpace = {action_space}, observationSpace = {observation_space})')
+    #     f'init(contex = {type(context)}, actionSpace = {action_space}, observationSpace = {observation_space})')
 
     # if observation_space['type'] == 'Discrete' and action_space['type'] == 'Discrete':
     rows = observation_space['n']
@@ -174,7 +186,7 @@ async def init(context, action_space, observation_space):
 
 
 async def decide(context, state):
-    # print(f'decide({context},{state})')
+    # print(f'decide({type(context)},{type(state)})')
 
     epsilon = context['epsilon']
     Q = np.array(context['Q'])
@@ -183,13 +195,13 @@ async def decide(context, state):
     if np.random.uniform(0, 1) < epsilon:
         action = sample_action_space(ENV_NAME)
     else:
-        action = np.argmax(Q[state, :])
-    return action
+        action = np.argmax(Q[int(state), :])
+    return int(action)
 
 
-async def learn(context, action, state, state2, reward, done, info):
+async def learn(context, action, state, state2, reward, done, inf):
     # print(
-    #     f'learn(action = {action}, context = {context}, state = {state}, state2 = {state2}, reward = {reward}, done = {done}, info = {info})')
+    #     f'learn(action = {action}, context = {context}, state = {state}, state2 = {state2}, reward = {reward}, done = {done}, inf = {inf})')
 
     Q = np.array(context['Q'])
     gamma = context['gamma']
@@ -200,6 +212,7 @@ async def learn(context, action, state, state2, reward, done, info):
     Q[state, action] = Q[state, action] + alpha * (target - predict)
 
     context['Q'] = Q.tolist()
+
     return context
 
 
@@ -215,7 +228,7 @@ def try_make_env(env_name):
     return env
 
 
-def create_space_dict(space):
+def create_space_dict_json(space):
     obj = dict()
     if isinstance(space, gym.spaces.Box):
         if np.issubdtype(space.low.dtype, np.float32):
@@ -237,21 +250,53 @@ def create_space_dict(space):
     return obj
 
 
-async def call_init(endpoint, initFn, context, env):
-    return await init(context, create_space_dict(env.action_space), create_space_dict(env.observation_space))
-    # client = CKGClient(endpoint)
-    # return context
+async def call_init(client, initFn, context, env):
+    query = f"""
+      query init($context: JSON!, $actionSpace: SpaceAsInput!, $observationSpace: SpaceAsInput!){{
+        {initFn}(context: $context, actionSpace: $actionSpace, observationSpace: $observationSpace)
+      }}
+    """
+    variables = {'context': json.dumps(context), 'actionSpace': create_space_dict_json(env.action_space),
+                 'observationSpace': create_space_dict_json(env.observation_space)}
+    d = await client.async_query(query, variables)
+    if 'errors' in d:
+        raise Exception(d['errors'][0])
+    return json.loads(d['data'][initFn])
 
 
-async def call_decide(endpoint, decideFn, context, state):
-    return await decide(context, state)
-    # action = "swim"
-    # return action
+async def call_decide(client, decideFn, context, state):
+    query = f"""
+      query decide($context: JSON!, $state: JSON!){{
+        {decideFn}(context: $context, state: $state)
+      }}
+    """
+    variables = {'context': json.dumps(
+        context), 'state': json.dumps(int(state))}
+    d = await client.async_query(query, variables)
+    if 'errors' in d:
+        raise Exception(d['errors'][0])
+    return json.loads(d['data'][decideFn])
 
 
-async def call_learn(endpoint, learnFn, context, action, state, state2, reward, done, info):
-    return await learn(context, action, state, state2, reward, done, info)
-    # return context
+async def call_learn(client, learnFn, context, action, state, state2, reward, done, inf):
+    query = f"""
+      query learn($context: JSON!, $action: JSON!, $state: JSON!, $state2: JSON!, $reward: Float!, $done: Boolean!, $inf: JSON!){{
+        {learnFn}(context: $context, action: $action, state: $state, state2: $state2, reward: $reward, done: $done, inf: $inf)
+      }}
+    """
+    variables = {
+        'context': json.dumps(context),
+        'action': json.dumps(int(action)),
+        'state': json.dumps(int(state)),
+        'state2': json.dumps(int(state2)),
+        'reward': reward,
+        'done': done,
+        'inf': json.dumps(inf),
+    }
+    d = await client.async_query(query, variables)
+    if 'errors' in d:
+        raise Exception(d['errors'][0])
+    return json.loads(d['data'][learnFn])
 
 
 #
@@ -272,6 +317,7 @@ def init_server(loopy):
 
     async def graphql(request):
         back = await request.json()
+        # print(f'----- RAW {back}')
         result = await gql.graphql(executable_schema, back.get('query', ''), variable_values=back.get('variables', ''),
                                    operation_name=back.get(
             'operationName', ''),

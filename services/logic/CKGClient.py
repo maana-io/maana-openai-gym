@@ -15,41 +15,49 @@ logging.basicConfig(stream=sys.stdout, level=LOG_LEVEL)
 
 class CKGClient:
 
-    def __init__(self, service_url, loop=asyncio.get_event_loop()):
+    def __init__(self, service_url, is_auth=True, loop=asyncio.get_event_loop()):
 
         self.service_url = service_url
 
-        domain = os.getenv('REMOTE_KSVC_AUTH_DOMAIN')
-        self.c_id = os.getenv('REMOTE_KSVC_AUTH_CLIENT_ID')
-        self.secret = os.getenv('REMOTE_KSVC_AUTH_CLIENT_SECRET')
-        self.identifier = os.getenv('REMOTE_KSVC_AUTH_IDENTIFIER')
+        domain = os.getenv('MACHINE_TO_MACHINE_AUTH_DOMAIN')
+        self.c_id = os.getenv('MACHINE_TO_MACHINE_AUTH_CLIENT_ID')
+        self.secret = os.getenv('MACHINE_TO_MACHINE_AUTH_CLIENT_SECRET')
+        self.identifier = os.getenv('MACHINE_TO_MACHINE_AUTH_IDENTIFIER')
 
-        try:
-            self.getter = GetToken(domain)
-            token = self.getter.client_credentials(client_id=self.c_id,
-                                                   client_secret=self.secret,
-                                                   audience=self.identifier)
+        if is_auth:
+            try:
+                self.getter = GetToken(domain)
+                token = self.getter.client_credentials(client_id=self.c_id,
+                                                       client_secret=self.secret,
+                                                       audience=self.identifier)
 
-            self.token = token['access_token']
-            self.expires = token['expires_in']
-            expiration_time = '{}d {}h:{}m:{}s'.format(self.expires // 86400,
-                                                       (self.expires %
-                                                        86400) // 3600,
-                                                       (self.expires %
-                                                        3600) // 60,
-                                                       self.expires % 60)
-            self.renewal_time_hours = .5 * (self.expires // 3600)
-            logger.info("Token expires in {}".format(expiration_time))
+                self.token = token['access_token']
+                self.expires = token['expires_in']
+                expiration_time = '{}d {}h:{}m:{}s'.format(self.expires // 86400,
+                                                           (self.expires %
+                                                            86400) // 3600,
+                                                           (self.expires %
+                                                            3600) // 60,
+                                                           self.expires % 60)
+                self.renewal_time_hours = .5 * (self.expires // 3600)
+                logger.info("Token expires in {}".format(expiration_time))
+                self.headers = {
+                    "Content-Type": "application/json",
+                    "authorization": "Bearer " + self.token
+                }
+                self.session = aiohttp.ClientSession(loop=loop)
+                asyncio.ensure_future(self.renewal(
+                    self.renewal_time_hours * 60 * 60))
+            except Exception as e:
+                logger.error(
+                    "Unable to connect to Maana {}".format(service_url))
+                logger.error("- exception: {}".format(e))
+                pass
+        else:
             self.headers = {
-                "Content-Type": "application/json",
-                "authorization": "Bearer " + self.token
+                "Content-Type": "application/json"
             }
             self.session = aiohttp.ClientSession(loop=loop)
-            asyncio.ensure_future(self.renewal(
-                self.renewal_time_hours * 60 * 60))
-        except Exception as e:
-            logger.error("Unable to connect to Maana {}".format(service_url))
-            pass
 
     async def renewal(self, initial_wait_time):
         await asyncio.sleep(initial_wait_time)
@@ -91,3 +99,6 @@ class CKGClient:
         else:
             logger.error("Query failed! Code: {}".format(resp.status))
             return None
+
+    def close_session(self):
+        asyncio.get_event_loop().run_until_complete(self.session.close())
