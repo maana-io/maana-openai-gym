@@ -18,6 +18,8 @@ from scalars import scalars
 
 # OpenAI Gym
 import gym
+from gym import envs
+import retro
 
 # Maana
 from CKGClient import CKGClient
@@ -27,25 +29,41 @@ from settings import SERVICE_ID, SERVICE_PORT, RABBITMQ_ADDR, RABBITMQ_PORT, SER
 logger = logging.getLogger(__name__)
 logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 
-ENV_NAME = "FrozenLake-v0"
-
 source_schema = """
     scalar JSON
 
     schema {
         query: RootQuery
     }
-
+    
     type RootQuery {
         train(env: String!, endpoint: String!, decideFn: String!, learnFn: String!, initFn: String!, context: JSON!, episodes: Int!, steps: Int!): JSON!
         decide(context: JSON!, state: JSON!): JSON!
         learn(context: JSON!, action: JSON!, state: JSON!, state2: JSON!, reward: Float!, done: Boolean!, info: JSON!): JSON!
         init(context: JSON!, actionSpace: SpaceAsInput! observationSpace: SpaceAsInput!): JSON!
-        sampleActionSpace(env: String!): JSON! # @TODO: interface Box/Discrete
+        sampleActionSpace(env: String!): Space!
+        listEnvs: [String!]
+    }
+
+    enum SpaceType {
+        Discrete,
+        BoxR,
+        BoxZ
+    }
+
+    type Space {
+        type: SpaceType!
+        n: Int
+        lowR: [Float!]
+        highR: [Float!]
+        lowZ: [Int!]
+        highZ: [Int]
+        shape: [Int!]
+        dtype: String
     }
 
     input SpaceAsInput {
-        id: ID!
+        type: SpaceType!
         shape: [Int!]!
         dtype: String!
     }
@@ -58,7 +76,8 @@ resolvers = {
         'decide': lambda value, info, **args: decide(args['context'], args['state']),
         'learn': lambda value, info, **args: learn(args['context'], args['action'], args['state'], args['state2'], args['reward'], args['done'], args['info']),
         'init': lambda value, info, **args: init(args['context'], args['actionSpace'], args['observationSpace']),
-        'sampleActionSpace': lambda value, info, **args: sample_action_space(args['env'])
+        'sampleActionSpace': lambda value, info, **args: sample_action_space(args['env']),
+        'listEnvs': lambda value, info, **args: list_envs()
     }
 }
 
@@ -68,10 +87,14 @@ executable_schema = build_executable_schema(source_schema, resolvers, scalars)
 # Resolver implementation
 #
 
+ENV_NAME = ""
+
 
 async def train(env_name, endpoint, decideFn, learnFn, initFn, context, episodes, steps):
-    print(f'train(env={env_name},endpoint={endpoint},decideFn={decideFn},learnFn={learnFn},initFn={initFn},context={context},episodes={episodes},steps={steps})')
-    env = gym.make(env_name)
+    # print(f'train(env={env_name},endpoint={endpoint},decideFn={decideFn},learnFn={learnFn},initFn={initFn},context={context},episodes={episodes},steps={steps})')
+    global ENV_NAME
+    ENV_NAME = env_name
+    env = try_make_env(env_name)
     context = await call_init(endpoint, initFn, context, env)
     wins = 0
     tot = 0
@@ -98,13 +121,37 @@ async def train(env_name, endpoint, decideFn, learnFn, initFn, context, episodes
 
             state = state2
 
-    print(f'final context={context}')
+    # print(f'final context={context}')
+    return context
+
+
+async def play(env_name, endpoint, decideFn, context):
+    # print(
+    #     f'play(env={env_name},endpoint={endpoint},decideFn={decideFn},context={context})')
+    env = try_make_env(env_name)
+    state = env.reset()
+    env.render()
+    done = False
+    while not done:
+        action = await call_decide(endpoint, decideFn, context, state)
+        state2, _, done, _ = env.step(action)
+        env.render()
+        state = state2
+
     return context
 
 
 def sample_action_space(env_name):
-    env = gym.make(env_name)
+    env = try_make_env(env_name)
     return env.action_space.sample()
+
+
+def list_envs():
+    x = retro.data.list_games() + \
+        [env_spec.id for env_spec in envs.registry.all()]
+    x.sort()
+    return x
+
 
 #
 # Testing
@@ -115,10 +162,13 @@ async def init(context, action_space, observation_space):
     # print(
     #     f'init(contex = {context}, actionSpace = {action_space}, observationSpace = {observation_space})')
 
+    # if observation_space['type'] == 'Discrete' and action_space['type'] == 'Discrete':
     rows = observation_space['n']
     cols = action_space['n']
 
-    context['Q'] = np.zeros((rows,  cols))
+    context['Q_rows'] = rows
+    context['Q_cols'] = cols
+    context['Q'] = np.zeros((rows,  cols)).tolist()
 
     return context
 
@@ -127,7 +177,7 @@ async def decide(context, state):
     # print(f'decide({context},{state})')
 
     epsilon = context['epsilon']
-    Q = context['Q']
+    Q = np.array(context['Q'])
 
     action = 0
     if np.random.uniform(0, 1) < epsilon:
@@ -141,7 +191,7 @@ async def learn(context, action, state, state2, reward, done, info):
     # print(
     #     f'learn(action = {action}, context = {context}, state = {state}, state2 = {state2}, reward = {reward}, done = {done}, info = {info})')
 
-    Q = context['Q']
+    Q = np.array(context['Q'])
     gamma = context['gamma']
     alpha = context['alpha']
 
@@ -149,7 +199,7 @@ async def learn(context, action, state, state2, reward, done, info):
     target = reward + gamma * np.max(Q[state2, :])
     Q[state, action] = Q[state, action] + alpha * (target - predict)
 
-    context['Q'] = Q
+    context['Q'] = Q.tolist()
     return context
 
 
@@ -157,18 +207,33 @@ async def learn(context, action, state, state2, reward, done, info):
 # Helpers
 #
 
+def try_make_env(env_name):
+    try:
+        env = gym.make(env_name)
+    except:
+        env = retro.make(env_name)
+    return env
+
 
 def create_space_dict(space):
     obj = dict()
     if isinstance(space, gym.spaces.Box):
-        obj['low'] = space.low.tolist()
-        obj['high'] = space.high.tolist()
+        if np.issubdtype(space.low.dtype, np.float32):
+            obj['type'] = 'BoxR'
+            obj['lowR'] = space.low.tolist()
+            obj['highR'] = space.high.tolist()
+        elif np.issubdtype(space.low.dtype, np.uint8):
+            obj['type'] = 'BoxZ'
+            obj['lowZ'] = space.low.tolist()
+            obj['highZ'] = space.high.tolist()
         obj['shape'] = space.shape
         obj['dtype'] = space.dtype.name
     elif isinstance(space, gym.spaces.Discrete):
+        obj['type'] = 'Discrete'
         obj['n'] = space.n
         obj['shape'] = space.shape
         obj['dtype'] = space.dtype.name
+    # print('obj', obj['type'])
     return obj
 
 

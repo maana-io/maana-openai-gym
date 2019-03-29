@@ -1,7 +1,34 @@
+query listEnvs {
+  listEnvs
+}
 query FrozenLake_v0 {
   train(
     # env: "CartPole-v0"
     env: "FrozenLake-v0"
+    episodes: 10000
+    steps: 100
+    context: "{ \"epsilon\": 0.9, \"alpha\": 0.81, \"gamma\": 0.96, \"Q\": [] }"
+    endpoint: "http://localhost:7357/graphql"
+    initFn: "init"
+    learnFn: "learn"
+    decideFn: "decide"
+  )
+}
+query CartPole_v0 {
+  train(
+    env: "CartPole-v0"
+    episodes: 10000
+    steps: 100
+    context: "{ \"epsilon\": 0.9, \"alpha\": 0.81, \"gamma\": 0.96, \"Q\": [] }"
+    endpoint: "http://localhost:7357/graphql"
+    initFn: "init"
+    learnFn: "learn"
+    decideFn: "decide"
+  )
+}
+query Airstriker_Genesis {
+  train(
+    env: "Airstriker-Genesis"
     episodes: 10000
     steps: 100
     context: "{ \"epsilon\": 0.9, \"alpha\": 0.81, \"gamma\": 0.96, \"Q\": [] }"
